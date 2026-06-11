@@ -150,6 +150,34 @@ nav button.active{color:var(--y);border-bottom-color:var(--y);}
   <div id="histBody"></div>
 </div>
 
+<script type="module">
+// ── FIREBASE SETUP ───────────────────────────────────────────────────────────
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-app.js";
+import { getDatabase, ref, set, get, onValue } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCMP9LcqpYkPijGPkx8gqOVbPF6wcV2hYU",
+  authDomain: "rock-the-lemons.firebaseapp.com",
+  databaseURL: "https://rock-the-lemons-default-rtdb.firebaseio.com",
+  projectId: "rock-the-lemons",
+  storageBucket: "rock-the-lemons.firebasestorage.app",
+  messagingSenderId: "720996286612",
+  appId: "1:720996286612:web:acef1e272bf4891218b481"
+};
+
+const fbApp = initializeApp(firebaseConfig);
+const db = getDatabase(fbApp);
+
+// Expose a minimal API to the main script via window.FB
+window.FB = {
+  write(path, value) { return set(ref(db, path), value); },
+  read(path) { return get(ref(db, path)).then(s => s.exists() ? s.val() : null); },
+  listen(path, cb) { onValue(ref(db, path), s => cb(s.exists() ? s.val() : null)); }
+};
+
+window.dispatchEvent(new Event('fb-ready'));
+</script>
+
 <script>
 // ── PRODUCTS ─────────────────────────────────────────────────────────────────
 const PRODUCTS = [
@@ -186,6 +214,15 @@ const STORE_KEY = 'rtl_list_v5';
 const SALES_KEY = 'rtl_sales_v5';
 const HIST_KEY  = 'rtl_hist_v5';
 
+// ── IN-MEMORY STATE (synced from Firebase) ───────────────────────────────────
+// These hold the current data. Firebase listeners keep them up to date,
+// and we cache to localStorage so the app still shows data if offline/loading.
+let STATE = {
+  list:  null,
+  sales: {lemon:0, sugar_free:0, strawberry:0},
+  hist:  []
+};
+
 // ── STORAGE ──────────────────────────────────────────────────────────────────
 function freshList() {
   const l = [];
@@ -195,35 +232,42 @@ function freshList() {
   return l;
 }
 
+// READS — return current in-memory state (kept fresh by Firebase listeners)
 function loadList() {
+  if (Array.isArray(STATE.list) && STATE.list.length >= EXPECTED) return STATE.list;
+  // fall back to local cache, then fresh defaults
   try {
     const raw = localStorage.getItem(STORE_KEY);
-    if (!raw) return freshList();
-    const p = JSON.parse(raw);
-    if (!Array.isArray(p) || p.length < EXPECTED) return freshList();
-    return p;
-  } catch(e) { return freshList(); }
+    if (raw) {
+      const p = JSON.parse(raw);
+      if (Array.isArray(p) && p.length >= EXPECTED) return p;
+    }
+  } catch(e) {}
+  return freshList();
 }
 
-function saveList(l)  { localStorage.setItem(STORE_KEY, JSON.stringify(l)); }
+function loadSales() { return STATE.sales || {lemon:0, sugar_free:0, strawberry:0}; }
+function loadHist()  { return Array.isArray(STATE.hist) ? STATE.hist : []; }
 
-function loadSales() {
-  try {
-    const raw = localStorage.getItem(SALES_KEY);
-    return raw ? JSON.parse(raw) : {lemon:0, sugar_free:0, strawberry:0};
-  } catch(e) { return {lemon:0, sugar_free:0, strawberry:0}; }
+// WRITES — update memory, cache locally, push to Firebase
+function saveList(l) {
+  STATE.list = l;
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(l)); } catch(e) {}
+  if (window.FB) window.FB.write('checklist', l).catch(()=>{});
 }
 
-function saveSales(s) { localStorage.setItem(SALES_KEY, JSON.stringify(s)); }
-
-function loadHist() {
-  try {
-    const raw = localStorage.getItem(HIST_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch(e) { return []; }
+function saveSales(s) {
+  STATE.sales = s;
+  try { localStorage.setItem(SALES_KEY, JSON.stringify(s)); } catch(e) {}
+  if (window.FB) window.FB.write('salesToday', s).catch(()=>{});
 }
 
-function saveHist(h) { localStorage.setItem(HIST_KEY, JSON.stringify(h)); }
+function saveHist(h) {
+  STATE.hist = h;
+  try { localStorage.setItem(HIST_KEY, JSON.stringify(h)); } catch(e) {}
+  if (window.FB) window.FB.write('history', h).catch(()=>{});
+}
+
 
 // ── MODAL & TOAST ────────────────────────────────────────────────────────────
 let modalResolve = null;
@@ -500,12 +544,64 @@ function showTab(name, btn) {
 }
 
 // ── INIT ─────────────────────────────────────────────────────────────────────
-// Clear all old version keys
+// Clear old version keys
 ['rtl_checklist','rtl_list','rtl_list2','rtl_sales','rtl_sales2','rtl_hist','rtl_hist2',
  'rtl_list_v3','rtl_sales_v3','rtl_hist_v3','rtl_list_v4','rtl_sales_v4','rtl_hist_v4'].forEach(k => localStorage.removeItem(k));
 
+// Render immediately from local cache so the app isn't blank while Firebase loads
 renderList();
 renderSales();
+
+// Track which paths have received their first cloud snapshot
+let seeded = { list:false, sales:false, hist:false };
+
+function startFirebase() {
+  if (!window.FB) return;
+
+  // CHECKLIST
+  window.FB.listen('checklist', val => {
+    if (val && Array.isArray(val) && val.length >= EXPECTED) {
+      STATE.list = val;
+      try { localStorage.setItem(STORE_KEY, JSON.stringify(val)); } catch(e) {}
+    } else if (!seeded.list) {
+      // Cloud empty on first load — seed it with current/default list
+      const initial = loadList();
+      STATE.list = initial;
+      window.FB.write('checklist', initial).catch(()=>{});
+    }
+    seeded.list = true;
+    renderList();
+  });
+
+  // SALES (today)
+  window.FB.listen('salesToday', val => {
+    if (val && typeof val === 'object') {
+      STATE.sales = {
+        lemon:      val.lemon      || 0,
+        sugar_free: val.sugar_free || 0,
+        strawberry: val.strawberry || 0
+      };
+      try { localStorage.setItem(SALES_KEY, JSON.stringify(STATE.sales)); } catch(e) {}
+    } else if (!seeded.sales) {
+      STATE.sales = {lemon:0, sugar_free:0, strawberry:0};
+      window.FB.write('salesToday', STATE.sales).catch(()=>{});
+    }
+    seeded.sales = true;
+    renderSales();
+  });
+
+  // HISTORY
+  window.FB.listen('history', val => {
+    STATE.hist = Array.isArray(val) ? val : [];
+    try { localStorage.setItem(HIST_KEY, JSON.stringify(STATE.hist)); } catch(e) {}
+    seeded.hist = true;
+    if (document.getElementById('tab-history').classList.contains('active')) renderHistory();
+  });
+}
+
+// Firebase module may load before or after this script runs
+if (window.FB) startFirebase();
+else window.addEventListener('fb-ready', startFirebase);
 </script>
 </body>
 </html>
